@@ -1,31 +1,18 @@
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
-import { createClient } from '@supabase/supabase-js'
 import OpenAI from 'openai'
 import axios from 'axios'
+import bcrypt from 'bcryptjs'
+import jwt from 'jsonwebtoken'
+import { ObjectId } from 'mongodb'
+import { getDb, isMongoConfigured } from './db.js'
 
 dotenv.config()
 
 const DEFAULT_AI_MODEL = process.env.DEFAULT_AI_MODEL || 'gpt-5-mini'
-
-const supabaseUrl = process.env.SUPABASE_URL
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY
-const isSupabaseConfigured =
-  supabaseUrl &&
-  supabaseServiceKey &&
-  supabaseUrl !== 'your_supabase_project_url' &&
-  supabaseServiceKey !== 'your_supabase_service_key' &&
-  supabaseUrl.startsWith('http')
-
-let supabase = null
-if (isSupabaseConfigured) {
-  try {
-    supabase = createClient(supabaseUrl, supabaseServiceKey)
-  } catch (error) {
-    console.warn('Supabase initialization failed:', error.message)
-  }
-}
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production'
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d'
 
 let openai = null
 if (process.env.OPENAI_API_KEY) {
@@ -34,12 +21,6 @@ if (process.env.OPENAI_API_KEY) {
   } catch (error) {
     console.warn('OpenAI initialization failed:', error.message)
   }
-}
-
-const ensureSupabase = (res) => {
-  if (supabase) return true
-  res.status(503).json({ success: false, error: 'Database not configured' })
-  return false
 }
 
 const buildVoiceFallback = (message = '') => {
@@ -58,34 +39,6 @@ const buildVoiceFallback = (message = '') => {
   }
 
   return 'Ask about safety, health, emergency help, weather, work guidance, or sensor usage.'
-}
-
-const verifyToken = async (req, res, next) => {
-  try {
-    const authHeader = req.headers.authorization
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ success: false, error: 'No token provided' })
-    }
-
-    if (!supabase) {
-      return res.status(503).json({ success: false, error: 'Database not configured' })
-    }
-
-    const token = authHeader.split(' ')[1]
-    const {
-      data: { user },
-      error,
-    } = await supabase.auth.getUser(token)
-
-    if (error || !user) {
-      return res.status(401).json({ success: false, error: 'Invalid token' })
-    }
-
-    req.user = user
-    next()
-  } catch (error) {
-    res.status(401).json({ success: false, error: 'Token verification failed' })
-  }
 }
 
 const generateWorkerDataset = () => {
@@ -107,53 +60,148 @@ const generateWorkerDataset = () => {
   return workers
 }
 
+const normalizeId = (value) => (value instanceof ObjectId ? value.toString() : String(value))
+const serializeDocument = (item) => (item ? { ...item, id: normalizeId(item._id), _id: undefined } : null)
+const serializeDocuments = (items = []) => items.map(serializeDocument)
+const toObjectId = (value) => (ObjectId.isValid(value) ? new ObjectId(value) : null)
+const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim())
+
+const sanitizeUser = (user = {}) => ({
+  id: normalizeId(user._id),
+  email: user.email,
+  created_at: user.createdAt,
+  updated_at: user.updatedAt,
+  user_metadata: {
+    name: user.name || '',
+    phone: user.phone || '',
+    language: user.language || 'en',
+  },
+})
+
+const sanitizeProfile = (user = {}) => ({
+  id: normalizeId(user._id),
+  name: user.name || '',
+  phone: user.phone || '',
+  language: user.language || 'en',
+  created_at: user.createdAt,
+  updated_at: user.updatedAt,
+})
+
+const buildSession = (user) => {
+  const accessToken = jwt.sign({ sub: normalizeId(user._id), email: user.email }, JWT_SECRET, {
+    expiresIn: JWT_EXPIRES_IN,
+  })
+
+  return {
+    access_token: accessToken,
+    token_type: 'bearer',
+    expires_in: JWT_EXPIRES_IN,
+  }
+}
+
+const buildRegex = (value) => new RegExp(String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
+
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, error: 'No token provided' })
+    }
+
+    if (!isMongoConfigured()) {
+      return res.status(503).json({ success: false, error: 'Database not configured' })
+    }
+
+    const token = authHeader.split(' ')[1]
+    const decoded = jwt.verify(token, JWT_SECRET)
+    const db = await getDb()
+    const user = await db.collection('users').findOne({ _id: new ObjectId(decoded.sub) })
+
+    if (!user) {
+      return res.status(401).json({ success: false, error: 'Invalid token' })
+    }
+
+    req.user = sanitizeUser(user)
+    req.userDoc = user
+    next()
+  } catch (error) {
+    res.status(401).json({ success: false, error: 'Token verification failed' })
+  }
+}
+
 export const createBaseApp = ({ arduinoRoutes = false, arduinoService = null } = {}) => {
   const app = express()
 
   app.use(cors())
   app.use(express.json())
 
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', async (_req, res) => {
+    let mongodb = false
+    if (isMongoConfigured()) {
+      try {
+        const db = await getDb()
+        await db.command({ ping: 1 })
+        mongodb = true
+      } catch {
+        mongodb = false
+      }
+    }
+
     res.json({
       status: 'ok',
       message: 'SAHAYAK API is running',
-      supabase: Boolean(supabase),
+      mongodb,
       mode: arduinoRoutes ? 'local' : 'serverless',
     })
   })
 
   app.post('/api/auth/signup', async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
-
-      const { email, password, name, phone, language } = req.body
-      const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-        email,
-        password,
-        email_confirm: true,
-        user_metadata: { name, phone, language: language || 'en' },
-      })
-
-      if (authError) {
-        return res.status(400).json({ success: false, error: authError.message })
+      if (!isMongoConfigured()) {
+        return res.status(503).json({ success: false, error: 'Database not configured' })
       }
 
-      const { data: profileData } = await supabase
-        .from('users')
-        .insert({
-          id: authData.user.id,
-          name,
-          phone,
-          language: language || 'en',
-        })
-        .select()
-        .single()
+      const { email, password, name, phone, language } = req.body
+      if (!email || !password) {
+        return res.status(400).json({ success: false, error: 'Email and password are required' })
+      }
+      if (!isValidEmail(email)) {
+        return res.status(400).json({ success: false, error: 'Please enter a valid email address' })
+      }
+      if (String(password).length < 6) {
+        return res.status(400).json({ success: false, error: 'Password must be at least 6 characters' })
+      }
+
+      const db = await getDb()
+      const users = db.collection('users')
+      const existingUser = await users.findOne({ email: String(email).toLowerCase() })
+
+      if (existingUser) {
+        return res.status(400).json({ success: false, error: 'User already exists' })
+      }
+
+      const now = new Date().toISOString()
+      const passwordHash = await bcrypt.hash(password, 10)
+      const userDoc = {
+        email: String(email).toLowerCase(),
+        passwordHash,
+        name: name || '',
+        phone: phone || '',
+        language: language || 'en',
+        createdAt: now,
+        updatedAt: now,
+      }
+
+      const result = await users.insertOne(userDoc)
+      const user = { ...userDoc, _id: result.insertedId }
+      const session = buildSession(user)
 
       res.json({
         success: true,
         data: {
-          user: authData.user,
-          profile: profileData || null,
+          user: sanitizeUser(user),
+          session,
+          profile: sanitizeProfile(user),
         },
       })
     } catch (error) {
@@ -163,22 +211,33 @@ export const createBaseApp = ({ arduinoRoutes = false, arduinoService = null } =
 
   app.post('/api/auth/signin', async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
-
-      const { email, password } = req.body
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-      if (error) {
-        return res.status(401).json({ success: false, error: error.message })
+      if (!isMongoConfigured()) {
+        return res.status(503).json({ success: false, error: 'Database not configured' })
       }
 
-      const { data: profile } = await supabase.from('users').select('*').eq('id', data.user.id).single()
+      const { email, password } = req.body
+      if (!email || !password) {
+        return res.status(400).json({ success: false, error: 'Email and password are required' })
+      }
+
+      const db = await getDb()
+      const user = await db.collection('users').findOne({ email: String(email).toLowerCase() })
+
+      if (!user) {
+        return res.status(401).json({ success: false, error: 'Invalid email or password' })
+      }
+
+      const passwordMatches = await bcrypt.compare(password, user.passwordHash || '')
+      if (!passwordMatches) {
+        return res.status(401).json({ success: false, error: 'Invalid email or password' })
+      }
 
       res.json({
         success: true,
         data: {
-          user: data.user,
-          session: data.session,
-          profile: profile || null,
+          user: sanitizeUser(user),
+          session: buildSession(user),
+          profile: sanitizeProfile(user),
         },
       })
     } catch (error) {
@@ -186,12 +245,15 @@ export const createBaseApp = ({ arduinoRoutes = false, arduinoService = null } =
     }
   })
 
-  app.get('/api/auth/user', verifyToken, async (req, res) => {
+  app.get('/api/auth/user', verifyToken, async (_req, res) => {
     try {
-      if (!ensureSupabase(res)) return
-
-      const { data: profile } = await supabase.from('users').select('*').eq('id', req.user.id).single()
-      res.json({ success: true, data: { user: req.user, profile: profile || null } })
+      res.json({
+        success: true,
+        data: {
+          user: _req.user,
+          profile: sanitizeProfile(_req.userDoc),
+        },
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -203,26 +265,18 @@ export const createBaseApp = ({ arduinoRoutes = false, arduinoService = null } =
 
   app.put('/api/auth/profile', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const updateDoc = {
+        name: req.body.name || '',
+        phone: req.body.phone || '',
+        language: req.body.language || 'en',
+        updatedAt: new Date().toISOString(),
+      }
 
-      const { name, phone, language } = req.body
-      const { data, error } = await supabase
-        .from('users')
-        .upsert(
-          {
-            id: req.user.id,
-            name,
-            phone,
-            language: language || 'en',
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'id' }
-        )
-        .select()
-        .single()
+      await db.collection('users').updateOne({ _id: req.userDoc._id }, { $set: updateDoc })
+      const updatedUser = await db.collection('users').findOne({ _id: req.userDoc._id })
 
-      if (error) throw error
-      res.json({ success: true, data })
+      res.json({ success: true, data: sanitizeProfile(updatedUser) })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -230,24 +284,19 @@ export const createBaseApp = ({ arduinoRoutes = false, arduinoService = null } =
 
   app.post('/api/health/record', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const payload = {
+        user_id: req.user.id,
+        heart_rate: req.body.heartRate ?? null,
+        spo2: req.body.spo2 ?? null,
+        temperature: req.body.temperature ?? null,
+        device_id: req.body.deviceId ?? null,
+        synced: true,
+        timestamp: new Date().toISOString(),
+      }
 
-      const { heartRate, spo2, temperature, deviceId } = req.body
-      const { data, error } = await supabase
-        .from('health_records')
-        .insert({
-          user_id: req.user.id,
-          heart_rate: heartRate,
-          spo2,
-          temperature,
-          device_id: deviceId,
-          synced: true,
-        })
-        .select()
-        .single()
-
-      if (error) throw error
-      res.json({ success: true, data })
+      const result = await db.collection('health_records').insertOne(payload)
+      res.json({ success: true, data: { ...payload, id: normalizeId(result.insertedId) } })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -255,21 +304,25 @@ export const createBaseApp = ({ arduinoRoutes = false, arduinoService = null } =
 
   app.get('/api/health/records', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const filter = { user_id: req.user.id }
+      if (req.query.startDate || req.query.endDate) {
+        filter.timestamp = {}
+        if (req.query.startDate) filter.timestamp.$gte = req.query.startDate
+        if (req.query.endDate) filter.timestamp.$lte = req.query.endDate
+      }
 
-      const { startDate, endDate } = req.query
-      let query = supabase
-        .from('health_records')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .order('timestamp', { ascending: false })
+      const data = await db
+        .collection('health_records')
+        .find(filter)
+        .sort({ timestamp: -1 })
+        .limit(100)
+        .toArray()
 
-      if (startDate) query = query.gte('timestamp', startDate)
-      if (endDate) query = query.lte('timestamp', endDate)
-
-      const { data, error } = await query.limit(100)
-      if (error) throw error
-      res.json({ success: true, data })
+      res.json({
+        success: true,
+        data: serializeDocuments(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -426,18 +479,19 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.get('/api/notifications', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const limit = Number(req.query.limit || 50)
+      const data = await db
+        .collection('notifications')
+        .find({ user_id: req.user.id })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .toArray()
 
-      const { limit = 50 } = req.query
-      const { data, error } = await supabase
-        .from('notifications')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .order('timestamp', { ascending: false })
-        .limit(Number(limit))
-
-      if (error) throw error
-      res.json({ success: true, data })
+      res.json({
+        success: true,
+        data: serializeDocuments(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -445,23 +499,17 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.post('/api/notifications', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
-
-      const { type, title, message } = req.body
-      const { data, error } = await supabase
-        .from('notifications')
-        .insert({
-          user_id: req.user.id,
-          type,
-          title,
-          message,
-          read: false,
-        })
-        .select()
-        .single()
-
-      if (error) throw error
-      res.json({ success: true, data })
+      const db = await getDb()
+      const payload = {
+        user_id: req.user.id,
+        type: req.body.type,
+        title: req.body.title,
+        message: req.body.message,
+        read: false,
+        timestamp: new Date().toISOString(),
+      }
+      const result = await db.collection('notifications').insertOne(payload)
+      res.json({ success: true, data: { ...payload, id: normalizeId(result.insertedId) } })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -469,18 +517,26 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.patch('/api/notifications/:id/read', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const notificationId = toObjectId(req.params.id)
+      if (!notificationId) {
+        return res.status(400).json({ success: false, error: 'Invalid notification id' })
+      }
 
-      const { data, error } = await supabase
-        .from('notifications')
-        .update({ read: true })
-        .eq('id', req.params.id)
-        .eq('user_id', req.user.id)
-        .select()
-        .single()
+      await db.collection('notifications').findOneAndUpdate(
+        { _id: notificationId, user_id: req.user.id },
+        { $set: { read: true } },
+        { returnDocument: 'after' }
+      )
+      const updated = await db.collection('notifications').findOne({
+        _id: notificationId,
+        user_id: req.user.id,
+      })
 
-      if (error) throw error
-      res.json({ success: true, data })
+      res.json({
+        success: true,
+        data: serializeDocument(updated),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -488,16 +544,17 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.get('/api/emergency-contacts', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const data = await db
+        .collection('emergency_contacts')
+        .find({ user_id: req.user.id })
+        .sort({ is_primary: -1, created_at: -1 })
+        .toArray()
 
-      const { data, error } = await supabase
-        .from('emergency_contacts')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .order('is_primary', { ascending: false })
-
-      if (error) throw error
-      res.json({ success: true, data })
+      res.json({
+        success: true,
+        data: serializeDocuments(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -505,23 +562,18 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.post('/api/emergency-contacts', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const payload = {
+        user_id: req.user.id,
+        name: req.body.name,
+        phone: req.body.phone,
+        relationship: req.body.relationship,
+        is_primary: req.body.isPrimary || false,
+        created_at: new Date().toISOString(),
+      }
 
-      const { name, phone, relationship, isPrimary } = req.body
-      const { data, error } = await supabase
-        .from('emergency_contacts')
-        .insert({
-          user_id: req.user.id,
-          name,
-          phone,
-          relationship,
-          is_primary: isPrimary || false,
-        })
-        .select()
-        .single()
-
-      if (error) throw error
-      res.json({ success: true, data })
+      const result = await db.collection('emergency_contacts').insertOne(payload)
+      res.json({ success: true, data: { ...payload, id: normalizeId(result.insertedId) } })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -529,15 +581,16 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.delete('/api/emergency-contacts/:id', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const contactId = toObjectId(req.params.id)
+      if (!contactId) {
+        return res.status(400).json({ success: false, error: 'Invalid contact id' })
+      }
 
-      const { error } = await supabase
-        .from('emergency_contacts')
-        .delete()
-        .eq('id', req.params.id)
-        .eq('user_id', req.user.id)
-
-      if (error) throw error
+      await db.collection('emergency_contacts').deleteOne({
+        _id: contactId,
+        user_id: req.user.id,
+      })
       res.json({ success: true })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
@@ -546,16 +599,25 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.get('/api/schemes', async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      if (!isMongoConfigured()) {
+        return res.json({ success: true, data: [] })
+      }
 
-      const { category, search } = req.query
-      let query = supabase.from('government_schemes').select('*').eq('active', true)
-      if (category && category !== 'all') query = query.eq('category', category)
-      if (search) query = query.or(`title.ilike.%${search}%,description.ilike.%${search}%`)
+      const db = await getDb()
+      const filter = { active: true }
+      if (req.query.category && req.query.category !== 'all') {
+        filter.category = req.query.category
+      }
+      if (req.query.search) {
+        const searchRegex = buildRegex(req.query.search)
+        filter.$or = [{ title: searchRegex }, { description: searchRegex }]
+      }
 
-      const { data, error } = await query.order('created_at', { ascending: false })
-      if (error) throw error
-      res.json({ success: true, data })
+      const data = await db.collection('government_schemes').find(filter).sort({ created_at: -1 }).toArray()
+      res.json({
+        success: true,
+        data: serializeDocuments(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -563,18 +625,25 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.get('/api/jobs', async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
-
-      const { type, search } = req.query
-      let query = supabase.from('jobs').select('*').eq('active', true)
-      if (type && type !== 'all') query = query.eq('type', type)
-      if (search) {
-        query = query.or(`title.ilike.%${search}%,company.ilike.%${search}%,description.ilike.%${search}%`)
+      if (!isMongoConfigured()) {
+        return res.json({ success: true, data: [] })
       }
 
-      const { data, error } = await query.order('created_at', { ascending: false })
-      if (error) throw error
-      res.json({ success: true, data })
+      const db = await getDb()
+      const filter = { active: true }
+      if (req.query.type && req.query.type !== 'all') {
+        filter.type = req.query.type
+      }
+      if (req.query.search) {
+        const searchRegex = buildRegex(req.query.search)
+        filter.$or = [{ title: searchRegex }, { company: searchRegex }, { description: searchRegex }]
+      }
+
+      const data = await db.collection('jobs').find(filter).sort({ created_at: -1 }).toArray()
+      res.json({
+        success: true,
+        data: serializeDocuments(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -582,16 +651,20 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.get('/api/education', async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      if (!isMongoConfigured()) {
+        return res.json({ success: true, data: [] })
+      }
 
-      const { category, language } = req.query
-      let query = supabase.from('education_content').select('*')
-      if (category) query = query.eq('category', category)
-      if (language) query = query.eq('language', language)
+      const db = await getDb()
+      const filter = {}
+      if (req.query.category) filter.category = req.query.category
+      if (req.query.language) filter.language = req.query.language
 
-      const { data, error } = await query.order('created_at', { ascending: false })
-      if (error) throw error
-      res.json({ success: true, data })
+      const data = await db.collection('education_content').find(filter).sort({ created_at: -1 }).toArray()
+      res.json({
+        success: true,
+        data: serializeDocuments(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -599,18 +672,16 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.get('/api/device', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const data = await db.collection('device_data').findOne(
+        { user_id: req.user.id },
+        { sort: { last_sync: -1 } }
+      )
 
-      const { data, error } = await supabase
-        .from('device_data')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .order('last_sync', { ascending: false })
-        .limit(1)
-        .single()
-
-      if (error && error.code !== 'PGRST116') throw error
-      res.json({ success: true, data: data || null })
+      res.json({
+        success: true,
+        data: serializeDocument(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }
@@ -618,27 +689,28 @@ Format as JSON with keys matchScore, missingSkills, strengths.`,
 
   app.post('/api/device', verifyToken, async (req, res) => {
     try {
-      if (!ensureSupabase(res)) return
+      const db = await getDb()
+      const filter = {
+        user_id: req.user.id,
+        device_id: req.body.deviceId,
+      }
+      const update = {
+        $set: {
+          user_id: req.user.id,
+          device_id: req.body.deviceId,
+          device_name: req.body.deviceName,
+          battery_level: req.body.batteryLevel,
+          firmware_version: req.body.firmwareVersion,
+          last_sync: new Date().toISOString(),
+        },
+      }
 
-      const { deviceId, deviceName, batteryLevel, firmwareVersion } = req.body
-      const { data, error } = await supabase
-        .from('device_data')
-        .upsert(
-          {
-            user_id: req.user.id,
-            device_id: deviceId,
-            device_name: deviceName,
-            battery_level: batteryLevel,
-            firmware_version: firmwareVersion,
-            last_sync: new Date().toISOString(),
-          },
-          { onConflict: 'user_id,device_id' }
-        )
-        .select()
-        .single()
-
-      if (error) throw error
-      res.json({ success: true, data })
+      await db.collection('device_data').updateOne(filter, update, { upsert: true })
+      const data = await db.collection('device_data').findOne(filter)
+      res.json({
+        success: true,
+        data: serializeDocument(data),
+      })
     } catch (error) {
       res.status(500).json({ success: false, error: error.message })
     }

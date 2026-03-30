@@ -7,16 +7,17 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test-db": "node test-supabase-connection.js",
-    "update-env": "node update-env.js"
+    "test-db": "node test-mongodb-connection.js"
   },
   "dependencies": {
     "@serialport/parser-readline": "^13.0.0",
-    "@supabase/supabase-js": "^2.38.4",
     "axios": "^1.6.2",
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.15.0",
     "openai": "^4.20.0",
     "serialport": "^13.0.0",
     "ws": "^8.18.3"
